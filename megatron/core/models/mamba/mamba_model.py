@@ -10,17 +10,12 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.quantization.utils import get_quant_config_or_none
-from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.utils import (
-    WrappedTensor,
-    deprecate_inference_params,
-    is_using_quantization_scales,
-)
+from megatron.core.utils import WrappedTensor, deprecate_inference_params
 
 
 class MambaModel(LanguageModule):
@@ -54,7 +49,7 @@ class MambaModel(LanguageModule):
         seq_len_interpolation_factor (Optional[float], optional): scale of linearly
             interpolating RoPE for longer sequences. The value must be a float larger than 1.0.
              Defaults to None.
-        pg_collection (ProcessGroupCollection, optional): Model communication process groups.
+        model_comm_pgs (ModelCommProcessGroups, optional): Model communication process groups.
     """
 
     def __init__(
@@ -77,9 +72,9 @@ class MambaModel(LanguageModule):
         rotary_base: int = 10000,
         scatter_embedding_sequence_parallel: bool = True,
         seq_len_interpolation_factor: Optional[float] = None,
-        pg_collection: Optional[ProcessGroupCollection] = None,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
     ) -> None:
-        super().__init__(config=config, pg_collection=pg_collection)
+        super().__init__(config=config, model_comm_pgs=model_comm_pgs)
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
@@ -108,7 +103,7 @@ class MambaModel(LanguageModule):
                 max_sequence_length=self.max_sequence_length,
                 position_embedding_type=position_embedding_type,
                 scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
-                tp_group=self.pg_collection.tp,
+                tp_group=self.model_comm_pgs.tp,
             )
 
         if self.position_embedding_type == 'rope':
@@ -118,7 +113,7 @@ class MambaModel(LanguageModule):
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
                 use_cpu_initialization=self.config.use_cpu_initialization,
-                cp_group=self.pg_collection.cp,
+                cp_group=self.model_comm_pgs.cp,
             )
 
         self.decoder = build_module(
@@ -130,7 +125,7 @@ class MambaModel(LanguageModule):
             hybrid_override_pattern=self.hybrid_override_pattern,
             post_process=self.post_process,
             dtype=config.params_dtype,
-            pg_collection=self.pg_collection,
+            model_comm_pgs=self.model_comm_pgs,
         )
 
         # Output
@@ -145,7 +140,7 @@ class MambaModel(LanguageModule):
                 gather_output=not self.parallel_output,
                 skip_weight_param_allocation=self.pre_process
                 and self.share_embeddings_and_output_weights,
-                tp_group=self.pg_collection.tp,
+                tp_group=self.model_comm_pgs.tp,
             )
 
         if self.pre_process or self.post_process:
@@ -205,15 +200,6 @@ class MambaModel(LanguageModule):
             pass
         elif self.pre_process:
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
-
-            # Clear the outputs for padding tokens when using dynamic batching with
-            # quantization scales to avoid corrupting amax calculations
-            if (
-                in_inference_mode
-                and inference_context.is_dynamic_batching()
-                and is_using_quantization_scales(self.config)
-            ):
-                decoder_input[inference_context.padding_slice] = 0.0
         else:
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor
@@ -258,40 +244,12 @@ class MambaModel(LanguageModule):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
-        sequence_parallel_override = False
         if in_inference_mode and inference_context.materialize_only_last_token_logits:
-            if inference_context.is_static_batching():
-                hidden_states = hidden_states[-1:, :, :]
-            else:
-                if self.output_layer.sequence_parallel:
-                    # Perform the sequence parallel gather here instead of after the output layer
-                    # because we need to slice the last token logits from the full view of the
-                    # packed logits across all requests.
-                    hidden_states = gather_from_sequence_parallel_region(
-                        hidden_states, group=self.pg_collection.tp
-                    )
-                    self.output_layer.sequence_parallel = False
-                    sequence_parallel_override = True
-
-                # Reshape [B, 1, H] to [1, B, H] → extract each sample’s true last‐token hidden
-                # state ([B, H]) → unsqueeze back to [B, 1, H]
-                # (so that the output layer, which expects S×B×H, receives only the final token)
-                hidden_states = inference_context.last_token_logits(
-                    hidden_states.squeeze(1).unsqueeze(0)
-                ).unsqueeze(1)
+            hidden_states = hidden_states[-1, :, :].unsqueeze(0)
 
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
-
-        # Restore sequence parallel execution to the output layer if necessary.
-        if sequence_parallel_override:
-            assert (
-                in_inference_mode
-                and inference_context.is_dynamic_batching()
-                and inference_context.materialize_only_last_token_logits
-            )
-            self.output_layer.sequence_parallel = True
 
         if labels is None:
             # [s b h] => [b s h]

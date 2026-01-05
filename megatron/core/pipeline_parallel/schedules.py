@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 import contextlib
 from functools import partial
@@ -16,9 +16,8 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_first_stage,
     is_vp_last_stage,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import GradFinalizeProcessGroups
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
-from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import (
     drain_embedding_wgrad_compute,
@@ -232,16 +231,12 @@ def forward_step_calc_loss(
 
     num_tokens = torch.tensor(0, dtype=torch.int)
     if is_last_stage:
-        if loss_func is None:
-            forward_data_store.append(output_tensor)
-        elif not collect_non_loss_data:
+        if not collect_non_loss_data:
             outputs = loss_func(output_tensor)
             if len(outputs) == 3:
                 output_tensor, num_tokens, loss_reduced = outputs
                 if not config.calculate_per_token_loss:
-                    # Protect against division by zero when all tokens are masked
-                    #   in a microbatch.
-                    output_tensor /= torch.clamp(num_tokens, min=1)
+                    output_tensor /= num_tokens
                     output_tensor /= num_microbatches
             else:
                 # preserve legacy loss averaging behavior (ie, over the number of microbatches)
@@ -271,7 +266,7 @@ def forward_step_calc_loss(
         if config.calculate_per_token_loss:
             MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
         else:
-            MoEAuxLossAutoScaler.set_loss_scale(loss_scale * cp_group_size / num_microbatches)
+            MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
 
     # Set the loss scale for Multi-Token Prediction (MTP) loss.
     if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
@@ -425,7 +420,14 @@ def forward_step(
     return [output_tensor], num_tokens
 
 
-def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config):
+def backward_step(
+    input_tensor,
+    output_tensor,
+    output_tensor_grad,
+    model_type,
+    config,
+    pipeline_model_parallel_size=1,
+):
     """Backward step through passed-in output tensor.
 
     If last stage, output_tensor_grad is None, otherwise gradient of loss
@@ -510,44 +512,44 @@ def forward_backward_no_pipelining(
     collect_non_loss_data: bool = False,
     first_val_step: Optional[bool] = None,
     adjust_tensor_shapes_fn: Optional[Callable] = None,  # unused
-    pg_collection: Optional[ProcessGroupCollection] = None,
+    grad_finalize_pgs: Optional[GradFinalizeProcessGroups] = None,
 ):
     """Run forward and backward passes with no pipeline parallelism"""
 
-    if pg_collection is None:
+    if grad_finalize_pgs is None:
         tp_group = parallel_state.get_tensor_model_parallel_group()
         cp_group = parallel_state.get_context_parallel_group()
         embd_group = parallel_state.get_embedding_group(check_initialized=False)
         pp_group = parallel_state.get_pipeline_model_parallel_group()
         pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
-        pg_collection = ProcessGroupCollection()
-        pg_collection.tp = tp_group
-        pg_collection.cp = cp_group
-        pg_collection.embd = embd_group
-        pg_collection.pos_embd = pos_emb_group
-        pg_collection.pp = pp_group
-        pg_collection.dp_cp = parallel_state.get_data_parallel_group(
+        grad_finalize_pgs = GradFinalizeProcessGroups()
+        grad_finalize_pgs.tp = tp_group
+        grad_finalize_pgs.cp = cp_group
+        grad_finalize_pgs.embd = embd_group
+        grad_finalize_pgs.pos_embd = pos_emb_group
+        grad_finalize_pgs.pp = pp_group
+        grad_finalize_pgs.dp_cp = parallel_state.get_data_parallel_group(
             with_context_parallel=True, partial_data_parallel=False
         )
 
-    elif pg_collection is not None:
-        assert hasattr(pg_collection, 'tp')
-        assert hasattr(pg_collection, 'cp')
-        assert hasattr(pg_collection, 'embd'), (
-            "pg_collection must have a embd. In previous version, it is used default "
+    elif grad_finalize_pgs is not None:
+        assert hasattr(grad_finalize_pgs, 'tp')
+        assert hasattr(grad_finalize_pgs, 'cp')
+        assert hasattr(grad_finalize_pgs, 'embd'), (
+            "grad_finalize_pgs must have a embd. In previous version, it is used default "
             "`parallel_state.default_embedding_ranks` to create the process group. If you are "
             "using the default process group, please use `parallel_state.get_embedding_group()` "
             "to get the process group. If you don't need explicitly set it to None."
         )
-        assert hasattr(pg_collection, 'pos_embd'), (
-            "pg_collection must have a pos_embd. In previous version, it is used default "
+        assert hasattr(grad_finalize_pgs, 'pos_embd'), (
+            "grad_finalize_pgs must have a pos_embd. In previous version, it is used default "
             "`parallel_state.default_position_embedding_ranks` to create the process group. "
             "If you are using the default process group, "
             "please use `parallel_state.get_position_embedding_group()` "
             "to get the process group. If you don't need explicitly set it to None."
         )
-        assert hasattr(pg_collection, 'pp')
-        assert hasattr(pg_collection, 'dp_cp')
+        assert hasattr(grad_finalize_pgs, 'pp')
+        assert hasattr(grad_finalize_pgs, 'dp_cp')
 
     if isinstance(model, list):
         assert len(model) == 1, "non-pipeline-parallel schedule does not support model chunking"
@@ -603,7 +605,7 @@ def forward_backward_no_pipelining(
                     input_tensor,
                     forward_data_store,
                     config,
-                    pg_collection.cp.size(),
+                    grad_finalize_pgs.cp.size(),
                     collect_non_loss_data,
                     is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
                     current_microbatch=i,
@@ -623,7 +625,7 @@ def forward_backward_no_pipelining(
             input_tensor,
             forward_data_store,
             config,
-            pg_collection.cp.size(),
+            grad_finalize_pgs.cp.size(),
             collect_non_loss_data,
             is_first_microbatch=check_first_val_step(
                 first_val_step, forward_only, num_microbatches == 1
@@ -642,16 +644,16 @@ def forward_backward_no_pipelining(
         config.finalize_model_grads_func(
             [model],
             total_num_tokens if config.calculate_per_token_loss else None,
-            pg_collection=pg_collection,
+            grad_finalize_pgs=grad_finalize_pgs,
         )
 
     if config.timers is not None:
         config.timers('forward-backward').stop()
 
     if (
-        hasattr(config, 'cuda_graph_impl')
-        and config.cuda_graph_impl == "local"
-        and CudaGraphScope.full_iteration not in config.cuda_graph_scope
+        hasattr(config, 'enable_cuda_graph')
+        and config.enable_cuda_graph
+        and config.cuda_graph_scope != "full_iteration"
     ):
         create_cudagraphs()
 
@@ -823,7 +825,7 @@ def forward_backward_pipelining_with_interleaving(
     first_val_step: Optional[bool] = None,
     adjust_tensor_shapes_fn: Optional[Callable] = None,  # unused
     p2p_communicator: Optional[P2PCommunicator] = None,
-    pg_collection: Optional[ProcessGroupCollection] = None,
+    grad_finalize_pgs: Optional[GradFinalizeProcessGroups] = None,
 ):
     """Run interleaved 1F1B schedule (model split into model chunks), with
     communication between pipeline stages as needed.
@@ -840,7 +842,7 @@ def forward_backward_pipelining_with_interleaving(
     # virtual_microbatch_id in [0, total_num_microbatches)
 
     config = get_model_config(model[0])
-    if p2p_communicator is None and pg_collection is None:
+    if p2p_communicator is None and grad_finalize_pgs is None:
         p2p_communicator = P2PCommunicator(
             pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
         )
@@ -850,45 +852,45 @@ def forward_backward_pipelining_with_interleaving(
         pp_group = parallel_state.get_pipeline_model_parallel_group()
         pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
 
-        pg_collection = ProcessGroupCollection()
-        pg_collection.tp = tp_group
-        pg_collection.cp = cp_group
-        pg_collection.embd = embd_group
-        pg_collection.pos_embd = pos_emb_group
-        pg_collection.pp = pp_group
-        pg_collection.dp_cp = parallel_state.get_data_parallel_group(
+        grad_finalize_pgs = GradFinalizeProcessGroups()
+        grad_finalize_pgs.tp = tp_group
+        grad_finalize_pgs.cp = cp_group
+        grad_finalize_pgs.embd = embd_group
+        grad_finalize_pgs.pos_embd = pos_emb_group
+        grad_finalize_pgs.pp = pp_group
+        grad_finalize_pgs.dp_cp = parallel_state.get_data_parallel_group(
             with_context_parallel=True, partial_data_parallel=False
         )
 
-    elif p2p_communicator is not None and pg_collection is not None:
+    elif p2p_communicator is not None and grad_finalize_pgs is not None:
         model_type = get_model_type(model[0])
         assert model_type != ModelType.encoder_and_decoder, (
             "encoder PP stages not yet supported when passing custom process groups. "
             "support coming soon!"
         )
         assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
-        assert hasattr(pg_collection, 'tp'), "pg_collection must have a tp_group"
-        assert hasattr(pg_collection, 'cp'), "pg_collection must have a cp_group"
-        assert hasattr(pg_collection, 'embd'), (
-            "pg_collection must have a embd. In previous version, it is used default "
+        assert hasattr(grad_finalize_pgs, 'tp'), "grad_finalize_pgs must have a tp_group"
+        assert hasattr(grad_finalize_pgs, 'cp'), "grad_finalize_pgs must have a cp_group"
+        assert hasattr(grad_finalize_pgs, 'embd'), (
+            "grad_finalize_pgs must have a embd. In previous version, it is used default "
             "`parallel_state.default_embedding_ranks` to create the process group. If you are "
             "using the default process group, please use `parallel_state.get_embedding_group()` "
             "to get the process group. If you don't need explicitly set it to None."
         )
-        assert hasattr(pg_collection, 'pos_embd'), (
-            "pg_collection must have a pos_embd. In previous version, it is used default "
+        assert hasattr(grad_finalize_pgs, 'pos_embd'), (
+            "grad_finalize_pgs must have a pos_embd. In previous version, it is used default "
             "`parallel_state.default_position_embedding_ranks` to create the process group."
             " If you are using the default process group, please use "
             "`parallel_state.get_position_embedding_group()` "
             "If you don't need pos_embd_group, you need to explicitly set it to None."
         )
-        assert hasattr(pg_collection, 'pp'), "pg_collection must have a pp_group"
-        assert hasattr(pg_collection, 'dp_cp'), "pg_collection must have a dp_cp_group"
-        tp_group = pg_collection.tp
-        cp_group = pg_collection.cp
+        assert hasattr(grad_finalize_pgs, 'pp'), "grad_finalize_pgs must have a pp_group"
+        assert hasattr(grad_finalize_pgs, 'dp_cp'), "grad_finalize_pgs must have a dp_cp_group"
+        tp_group = grad_finalize_pgs.tp
+        cp_group = grad_finalize_pgs.cp
     else:
         raise ValueError(
-            "Invalid combination of p2p_communicator, pg_collection"
+            "Invalid combination of p2p_communicator, grad_finalize_pgs"
             " provide none or provide all the process groups"
         )
 
@@ -1217,7 +1219,7 @@ def forward_backward_pipelining_with_interleaving(
             input_tensor,
             forward_data_store,
             config,
-            cp_group_size=pg_collection.cp.size(),
+            cp_group_size=grad_finalize_pgs.cp.size(),
             collect_non_loss_data=collect_non_loss_data,
             checkpoint_activations_microbatch=checkpoint_activations_microbatch,
             is_first_microbatch=check_first_val_step(
@@ -1283,7 +1285,12 @@ def forward_backward_pipelining_with_interleaving(
         )
 
         input_tensor_grad = backward_step(
-            input_tensor, output_tensor, output_tensor_grad, model_type, config
+            input_tensor,
+            output_tensor,
+            output_tensor_grad,
+            model_type,
+            config,
+            pipeline_model_parallel_size=p2p_communicator.pp_group.size(),
         )
 
         backward_step_helper_postprocess(virtual_microbatch_id)
@@ -1902,7 +1909,7 @@ def forward_backward_pipelining_with_interleaving(
         config.finalize_model_grads_func(
             model,
             total_num_tokens if config.calculate_per_token_loss else None,
-            pg_collection=pg_collection,
+            grad_finalize_pgs=grad_finalize_pgs,
         )
 
     # Restore config.grad_sync_func and config.param_sync_func.
@@ -1913,9 +1920,9 @@ def forward_backward_pipelining_with_interleaving(
         config.timers('forward-backward').stop()
 
     if (
-        hasattr(config, 'cuda_graph_impl')
-        and config.cuda_graph_impl == "local"
-        and CudaGraphScope.full_iteration not in config.cuda_graph_scope
+        hasattr(config, 'enable_cuda_graph')
+        and config.enable_cuda_graph
+        and config.cuda_graph_scope != "full_iteration"
     ):
         create_cudagraphs()
     nvtx_range_pop(suffix="misc")
@@ -1963,7 +1970,7 @@ def forward_backward_pipelining_without_interleaving(
     first_val_step: Optional[bool] = None,
     adjust_tensor_shapes_fn: Optional[Callable] = None,
     p2p_communicator: Optional[P2PCommunicator] = None,
-    pg_collection: Optional[ProcessGroupCollection] = None,
+    grad_finalize_pgs: Optional[GradFinalizeProcessGroups] = None,
 ):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
     stages. Returns dictionary with losses if the last stage, empty dict otherwise."""
@@ -1985,7 +1992,7 @@ def forward_backward_pipelining_without_interleaving(
             "Non-interleaved pipeline parallelism does not support overlapping p2p communication"
         )
 
-    if p2p_communicator is None and pg_collection is None:
+    if p2p_communicator is None and grad_finalize_pgs is None:
         p2p_communicator = P2PCommunicator(
             pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
         )
@@ -1995,45 +2002,45 @@ def forward_backward_pipelining_without_interleaving(
         pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
         pp_group = parallel_state.get_pipeline_model_parallel_group()
 
-        pg_collection = ProcessGroupCollection()
-        pg_collection.tp = tp_group
-        pg_collection.pp = pp_group
-        pg_collection.embd = embd_group
-        pg_collection.pos_embd = pos_emb_group
-        pg_collection.cp = cp_group
-        pg_collection.dp_cp = parallel_state.get_data_parallel_group(
+        grad_finalize_pgs = GradFinalizeProcessGroups()
+        grad_finalize_pgs.tp = tp_group
+        grad_finalize_pgs.pp = pp_group
+        grad_finalize_pgs.embd = embd_group
+        grad_finalize_pgs.pos_embd = pos_emb_group
+        grad_finalize_pgs.cp = cp_group
+        grad_finalize_pgs.dp_cp = parallel_state.get_data_parallel_group(
             with_context_parallel=True, partial_data_parallel=False
         )
-    elif p2p_communicator is not None and pg_collection is not None:
+    elif p2p_communicator is not None and grad_finalize_pgs is not None:
         model_type = get_model_type(model)
         assert model_type != ModelType.encoder_and_decoder, (
             "encoder PP stages not yet supported when passing custom process groups. "
             "support coming soon!"
         )
         assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
-        assert hasattr(pg_collection, 'tp'), "pg_collection must have tp_group"
-        assert hasattr(pg_collection, 'cp'), "pg_collection must have cp_group"
-        assert hasattr(pg_collection, 'embd'), (
-            "pg_collection must have a embd. In previous version, it is used default "
+        assert hasattr(grad_finalize_pgs, 'tp'), "grad_finalize_pgs must have tp_group"
+        assert hasattr(grad_finalize_pgs, 'cp'), "grad_finalize_pgs must have cp_group"
+        assert hasattr(grad_finalize_pgs, 'embd'), (
+            "grad_finalize_pgs must have a embd. In previous version, it is used default "
             "`parallel_state.default_embedding_ranks` to create the process group. "
             " If you are using the default process group, please use "
             " `parallel_state.get_embedding_group()` "
             "If you don't need embd_group, you need to explicitly set it to None."
         )
-        assert hasattr(pg_collection, 'pos_embd'), (
-            "pg_collection must have a pos_embd. In previous version, it is used default "
+        assert hasattr(grad_finalize_pgs, 'pos_embd'), (
+            "grad_finalize_pgs must have a pos_embd. In previous version, it is used default "
             "`parallel_state.default_position_embedding_ranks` to create the process group. "
             " If you are using the default process group, please use  "
             " `parallel_state.get_position_embedding_group()` "
             "If you don't need pos_embd_group, you need to explicitly set it to None."
         )
-        assert hasattr(pg_collection, 'pp'), "pg_collection must have pp_group"
-        assert hasattr(pg_collection, 'dp_cp'), "pg_collection must have dp_cp_group"
-        tp_group = pg_collection.tp
-        cp_group = pg_collection.cp
+        assert hasattr(grad_finalize_pgs, 'pp'), "grad_finalize_pgs must have pp_group"
+        assert hasattr(grad_finalize_pgs, 'dp_cp'), "grad_finalize_pgs must have dp_cp_group"
+        tp_group = grad_finalize_pgs.tp
+        cp_group = grad_finalize_pgs.cp
     else:
         raise ValueError(
-            "Invalid combination of p2p_communicator, pg_collection "
+            "Invalid combination of p2p_communicator, grad_finalize_pgs "
             "provide none or provide all the process groups"
         )
 
@@ -2143,7 +2150,7 @@ def forward_backward_pipelining_without_interleaving(
             input_tensor,
             forward_data_store,
             config,
-            cp_group_size=pg_collection.cp.size(),
+            cp_group_size=grad_finalize_pgs.cp.size(),
             collect_non_loss_data=collect_non_loss_data,
             checkpoint_activations_microbatch=checkpoint_activations_microbatch,
             is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
@@ -2186,7 +2193,7 @@ def forward_backward_pipelining_without_interleaving(
             input_tensor,
             forward_data_store,
             config,
-            cp_group_size=pg_collection.cp.size(),
+            cp_group_size=grad_finalize_pgs.cp.size(),
             collect_non_loss_data=collect_non_loss_data,
             checkpoint_activations_microbatch=checkpoint_activations_microbatch,
             is_first_microbatch=check_first_val_step(
@@ -2227,7 +2234,12 @@ def forward_backward_pipelining_without_interleaving(
                     enable_grad_sync()
 
             input_tensor_grad = backward_step(
-                input_tensor, output_tensor, output_tensor_grad, model_type, config
+                input_tensor,
+                output_tensor,
+                output_tensor_grad,
+                model_type,
+                config,
+                p2p_communicator.pp_group.size(),
             )
 
             if last_iteration:
@@ -2263,7 +2275,12 @@ def forward_backward_pipelining_without_interleaving(
             )
 
             input_tensor_grad = backward_step(
-                input_tensor, output_tensor, output_tensor_grad, model_type, config
+                input_tensor,
+                output_tensor,
+                output_tensor_grad,
+                model_type,
+                config,
+                pipeline_model_parallel_size=p2p_communicator.pp_group.size(),
             )
 
             p2p_communicator.send_backward(
@@ -2290,16 +2307,16 @@ def forward_backward_pipelining_without_interleaving(
         config.finalize_model_grads_func(
             [model],
             total_num_tokens if config.calculate_per_token_loss else None,
-            pg_collection=pg_collection,
+            grad_finalize_pgs=grad_finalize_pgs,
         )
 
     if config.timers is not None:
         config.timers('forward-backward').stop()
 
     if (
-        hasattr(config, 'cuda_graph_impl')
-        and config.cuda_graph_impl == "local"
-        and CudaGraphScope.full_iteration not in config.cuda_graph_scope
+        hasattr(config, 'enable_cuda_graph')
+        and config.enable_cuda_graph
+        and config.cuda_graph_scope != "full_iteration"
     ):
         create_cudagraphs()
 

@@ -62,7 +62,10 @@ class ShardDistribution(NamedTuple):
 
 def _shard_size(sh_ten: ShardedTensor):
     """Returns size in bytes of a given sharded tensor."""
-    numel = np.prod(sh_ten.local_shape)
+    if sh_ten.flattened_range is None:
+        numel = np.product(sh_ten.local_shape)
+    else:
+        numel = sh_ten.flattened_range.stop - sh_ten.flattened_range.start
     return numel * torch._utils._element_size(sh_ten.dtype)
 
 

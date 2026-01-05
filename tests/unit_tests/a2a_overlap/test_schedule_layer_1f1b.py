@@ -38,15 +38,15 @@ def run_transformer_layer_ref_with_capture(model, input_tensors, iterations):
     Returns:
         dict: A dictionary containing model outputs and parameter gradients.
     """
-    transformer_layer = model.decoder.layers[0]
+
     output_tensors = []
     for i in range(iterations):
-        output = transformer_layer(input_tensors[i].clone())[0]
+        output = model(input_tensors[i].clone())[0]
         output_tensors.append(output)
         output.backward(torch.ones_like(output))
 
     capture = {"outputs": output_tensors}
-    for name, param in transformer_layer.named_parameters():
+    for name, param in model.named_parameters():
         capture[name] = param.grad
 
     return capture
@@ -64,21 +64,17 @@ def run_transformer_layer_a2a_overlap_with_capture(model, input_tensors, microba
     Returns:
         dict: A dictionary containing model outputs and parameter gradients.
     """
-    transformer_layer = model.decoder.layers[0]
     for i in range(len(input_tensors)):
         input_tensors[i] = input_tensors[i].clone()
 
     event = torch.cuda.Event()
     comp_stream = torch.cuda.current_stream()
     comm_stream = torch.cuda.Stream(device="cuda")
-    state = DummyState()
-    state.is_mtp = False
-    state.model = model
     layers = [
         TransformerLayerSchedulePlan(
-            transformer_layer,
+            model,
             event,
-            state,
+            DummyState(),
             comp_stream,
             comm_stream,
             extra_args={"is_moe": True, "enable_deepep": False},
@@ -104,7 +100,7 @@ def run_transformer_layer_a2a_overlap_with_capture(model, input_tensors, microba
     TransformerLayerSchedulePlan.run(None, layers[-1], f_input=None, b_grad=torch.ones_like(output))
     torch.cuda.synchronize()
     capture = {"outputs": output_tensors}
-    for name, param in transformer_layer.named_parameters():
+    for name, param in model.named_parameters():
         capture[name] = param.grad
 
     return capture
@@ -196,7 +192,6 @@ def run_mtp_layer_a2a_overlap_with_capture(
         state.rotary_pos_cos = rotary_pos_cos
         state.rotary_pos_sin = rotary_pos_sin
         state.model = model
-        state.is_mtp = True
         event = torch.cuda.Event()
         layers.append(
             TransformerLayerSchedulePlan(
@@ -278,18 +273,21 @@ class TestA2AOverlap:
                 post_process=True,
                 max_sequence_length=300,
             )
+            model = gpt_model.decoder.layers[0]
 
             params = reset_model(gpt_model)
             input_tensors = [build_data() for _ in range(microbatches)]
 
-            fp8_context = get_fp8_context(config, 0) if config.fp8 else nullcontext()
+            fp8_context = (
+                get_fp8_context(config, model.layer_number - 1) if config.fp8 else nullcontext()
+            )
             with fp8_context:
                 capture_ref = run_transformer_layer_ref_with_capture(
-                    gpt_model, input_tensors, microbatches
+                    model, input_tensors, microbatches
                 )
             reset_model(gpt_model, params)
             capture_a2a_overlap = run_transformer_layer_a2a_overlap_with_capture(
-                gpt_model, input_tensors, microbatches
+                model, input_tensors, microbatches
             )
             comp_res = compare_captures(capture_ref, capture_a2a_overlap, True)
             assert comp_res[0], f"[rank {torch.distributed.get_rank()}] {comp_res[1]}"
@@ -321,16 +319,21 @@ class TestA2AOverlap:
                 post_process=True,
                 max_sequence_length=300,
             )
+            model = gpt_model.decoder.layers[0]
 
             params = reset_model(gpt_model)
             input_tensors = [build_data() for _ in range(microbatches)]
 
-            fp8_context = get_fp8_context(ref_config, 0) if ref_config.fp8 else nullcontext()
+            fp8_context = (
+                get_fp8_context(ref_config, model.layer_number - 1)
+                if ref_config.fp8
+                else nullcontext()
+            )
             with fp8_context:
                 capture_ref = run_transformer_layer_ref_with_capture(
-                    gpt_model, input_tensors, microbatches
+                    model, input_tensors, microbatches
                 )
-            del gpt_model
+            del gpt_model, model
 
             gpt_model = GPTModel(
                 config=overlap_config,
@@ -340,9 +343,10 @@ class TestA2AOverlap:
                 post_process=True,
                 max_sequence_length=300,
             )
+            model = gpt_model.decoder.layers[0]
             reset_model(gpt_model, params)
             capture_a2a_overlap = run_transformer_layer_a2a_overlap_with_capture(
-                gpt_model, input_tensors, microbatches
+                model, input_tensors, microbatches
             )
             comp_res = compare_captures(capture_ref, capture_a2a_overlap, True)
             assert comp_res[0], f"[rank {torch.distributed.get_rank()}] {comp_res[1]}"
@@ -358,7 +362,7 @@ class TestA2AOverlap:
 
         extra_kwargs = {"moe_token_dispatcher_type": dispatcher_type}
         if dispatcher_type == "flex":
-            extra_kwargs["moe_flex_dispatcher_backend"] = "deepep"
+            extra_kwargs["moe_enable_deepep"] = True
             extra_kwargs["moe_router_dtype"] = "fp32"
         if fp8_flag is not None:
             extra_kwargs["fp8"] = fp8_flag[0]
@@ -377,18 +381,21 @@ class TestA2AOverlap:
                 post_process=True,
                 max_sequence_length=300,
             )
+            model = gpt_model.decoder.layers[0]
 
             params = reset_model(gpt_model)
             input_tensors = [build_data() for _ in range(microbatches)]
 
-            fp8_context = get_fp8_context(config, 0) if config.fp8 else nullcontext()
+            fp8_context = (
+                get_fp8_context(config, model.layer_number - 1) if config.fp8 else nullcontext()
+            )
             with fp8_context:
                 capture_ref = run_transformer_layer_ref_with_capture(
-                    gpt_model, input_tensors, microbatches
+                    model, input_tensors, microbatches
                 )
             reset_model(gpt_model, params)
             capture_a2a_overlap = run_transformer_layer_a2a_overlap_with_capture(
-                gpt_model, input_tensors, microbatches
+                model, input_tensors, microbatches
             )
             comp_res = compare_captures(capture_ref, capture_a2a_overlap, True)
             assert comp_res[0], f"[rank {torch.distributed.get_rank()}] {comp_res[1]}"
@@ -408,7 +415,7 @@ class TestA2AOverlap:
             "mtp_loss_scaling_factor": 1.1,
         }
         if dispatcher_type == "flex":
-            extra_kwargs["moe_flex_dispatcher_backend"] = "deepep"
+            extra_kwargs["moe_enable_deepep"] = True
             extra_kwargs["moe_router_dtype"] = "fp32"
         if fp8_flag is not None:
             extra_kwargs["fp8_recipe"] = fp8_flag[1]

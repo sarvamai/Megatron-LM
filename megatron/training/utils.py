@@ -5,7 +5,6 @@ import json
 import os
 import sys
 import warnings
-from contextlib import contextmanager
 from datetime import datetime
 from collections import defaultdict
 
@@ -31,7 +30,7 @@ except ImportError:
             local_multi_tensor_applier as multi_tensor_applier,
         )
 
-from megatron.training import get_args, get_timers, get_adlr_autoresume
+from megatron.training import get_args, get_adlr_autoresume
 from megatron.core import mpu
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
@@ -80,21 +79,10 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
                 continue
             assert is_not_tp_duplicate
             if not getattr(param, 'allreduce', True):
+                # TODO: Implement memory optimization for MoE parameters.
                 assert param_is_not_shared(param)
                 param = to_local_if_dtensor(param)
-                if args.bf16:
-                    if not force_create_fp32_copy and hasattr(param, 'main_param'):
-                        if getattr(param, 'main_param_sharded', False):
-                            if param.main_param is not None:
-                                sharded_params_data.append(param.main_param)
-                        else:
-                            moe_params_data.append(param.main_param)
-                    else:
-                        # Fallback to original logic of making a fp32 copy of the
-                        # parameter if `.main_param` attribute is not available.
-                        moe_params_data.append(param.data.float())
-                else:
-                    moe_params_data.append(param.data)
+                moe_params_data.append(param.data.float() if args.bf16 else param.data)
             else:
                 if param_is_not_shared(param):
                     param = to_local_if_dtensor(param)
@@ -139,16 +127,14 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
             False,  # no per-parameter norm.
         )
         sharded_norm_2 = sharded_norm * sharded_norm
-    else:
-        sharded_norm_2 = torch.zeros((1,), dtype=torch.float32, device='cuda')
-    # Sum over all DP groups, including CP since distributed optimizer state is
-    # sharded jointly over DP+CP.
-    torch.distributed.all_reduce(
-        sharded_norm_2,
-        op=torch.distributed.ReduceOp.SUM,
-        group=mpu.get_data_parallel_group(with_context_parallel=True)
-    )
-    norm_2 += sharded_norm_2
+        # Sum over all DP groups, including CP since distributed optimizer state is
+        # sharded jointly over DP+CP.
+        torch.distributed.all_reduce(
+            sharded_norm_2,
+            op=torch.distributed.ReduceOp.SUM,
+            group=mpu.get_data_parallel_group(with_context_parallel=True)
+        )
+        norm_2 += sharded_norm_2
 
     # Add norm contribution from expert layers in MoEs.
     if len(moe_params_data) > 0:
@@ -323,13 +309,9 @@ def check_adlr_autoresume_termination(iteration, model, optimizer, opt_param_sch
         sys.exit(0)
 
 
-def get_ltor_masks_and_position_ids(data,
-                                    eod_token,
-                                    pad_token,
-                                    reset_position_ids,
-                                    reset_attention_mask,
-                                    eod_mask_loss,
-                                    pad_mask_loss):
+def get_ltor_masks_and_position_ids(
+    data, eod_token, reset_position_ids, reset_attention_mask, eod_mask_loss
+):
     """Build masks and position id for left to right model."""
 
     # Extract batch size and sequence length.
@@ -348,8 +330,6 @@ def get_ltor_masks_and_position_ids(data,
     loss_mask = torch.ones(data.size(), dtype=torch.float, device=data.device)
     if eod_mask_loss:
         loss_mask[data == eod_token] = 0.0
-    if pad_mask_loss:
-        loss_mask[data == pad_token] = 0.0
 
     # Position ids.
     position_ids = torch.arange(seq_length, dtype=torch.long, device=data.device)
@@ -363,7 +343,7 @@ def get_ltor_masks_and_position_ids(data,
         for b in range(micro_batch_size):
 
             # Find indecies where EOD token is.
-            eod_index = position_ids[b, data[b] == eod_token] & position_ids[b, data[b] == pad_token]
+            eod_index = position_ids[b, data[b] == eod_token]
             # Detach indecies from positions if going to modify positions.
             if reset_position_ids:
                 eod_index = eod_index.clone()
@@ -421,23 +401,11 @@ def is_last_rank():
 
 def print_rank_last(message):
     """If distributed is initialized, print only on last rank."""
-    if torch.distributed.is_initialized() and torch.distributed.get_backend() != 'fake':
+    if torch.distributed.is_initialized():
         if is_last_rank():
             print(message, flush=True)
     else:
         print(message, flush=True)
-
-
-def is_first_or_last_pipeline_stage(vp_stage):
-    """Return True if on first or last pipeline stage, taking into account virtual
-    pipeline parallelism."""
-    ignore_virtual = True
-    if vp_stage is not None:
-        ignore_virtual = False
-    return (
-        mpu.is_pipeline_first_stage(ignore_virtual=ignore_virtual, vp_stage=vp_stage)
-        or mpu.is_pipeline_last_stage(ignore_virtual=ignore_virtual, vp_stage=vp_stage)
-    )
 
 
 def get_device_arch_version():
@@ -525,8 +493,11 @@ def get_batch_on_this_tp_rank(data_iterator):
 
     if mpu.get_tensor_model_parallel_rank() == 0:
 
-        assert data_iterator is not None
-        data = next(data_iterator)
+        if data_iterator is not None:
+            data = next(data_iterator)
+        else:
+            data = None
+
         batch = {
             'tokens': data["tokens"].cuda(non_blocking=True),
             'labels': data["labels"].cuda(non_blocking=True),
@@ -636,57 +607,3 @@ def get_batch_on_this_tp_rank(data_iterator):
 
 def update_use_dist_ckpt(args):
     args.use_dist_ckpt = args.ckpt_format != "torch"
-
-
-def to_empty_if_meta_device(module: torch.nn.Module, *, device: torch.device, recurse=True):
-    """Move tensors to device if not meta device; otherwise materialize with empty_like().
-
-    Officially, torch suggests to_empty() for meta device materialization. Under the hood,
-    torch.empty_like() is applied to all parameters or buffers (see _apply). This may
-    accidently overwrite buffers with precomputed values during construction. Given the
-    goal is to only materialize those tensors on meta device, this function checks the
-    device first and only move the tensor to the destination if it is not on meta device.
-   
-    Args:
-        module: The target module to apply this transformation.
-        device: The desired device of the parameters
-            and buffers in this module.
-        recurse: Whether parameters and buffers of submodules should
-            be recursively moved to the specified device.
-    """
-
-    def _empty_like_if_meta(tensor: torch.Tensor, *, device: torch.device):
-        if tensor.device == torch.device("meta"):
-            return torch.empty_like(tensor, device=device)
-        else:
-            return tensor.to(device)
-
-    return module._apply(
-        lambda t: _empty_like_if_meta(t, device=device), recurse=recurse
-    )
-
-
-def get_nvtx_range():
-    """Create an NVTX range context manager."""
-    try:
-        from torch.cuda import nvtx
-
-        @contextmanager
-        def nvtx_range(msg, time=False):
-            if time:
-                timers = get_timers()
-                timers(msg, log_level=0).start()
-            try:
-                nvtx.range_push(msg)
-                yield
-            finally:
-                nvtx.range_pop()
-                if time:
-                    timers(msg, log_level=0).stop()
-
-        return nvtx_range
-    except:
-        @contextmanager
-        def dummy_range(msg):
-            yield
-        return dummy_range

@@ -7,6 +7,7 @@ from typing import Any, Dict, Iterable, Optional, Union
 
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.fp8_utils import prepare_model_for_fp8_inference
 from megatron.core.inference.communication_utils import (
     is_pipeline_first_stage,
@@ -19,8 +20,8 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
     InferenceWrapperConfig,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.utils import get_attr_wrapped_model, get_model_config
+from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.utils import get_model_config
 
 
 # pylint: disable=line-too-long
@@ -38,7 +39,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
             hidden size, vocab size etc.
         inference_context (BaseInferenceContext): Context for managing KV
             cache and other inference params.
-        pg_collection (ProcessGroupCollection): Process groups for model communication.
+        model_comm_pgs (ModelCommProcessGroups): Process groups for model communication.
     """
 
     def __init__(
@@ -46,7 +47,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         model: Union['LegacyGPTModel', GPTModel],  # type: ignore[name-defined]
         inference_wrapper_config: InferenceWrapperConfig,
         inference_context: Optional[BaseInferenceContext] = None,
-        pg_collection: Optional[ProcessGroupCollection] = None,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
     ):
         assert not isinstance(
             model, Iterable
@@ -71,11 +72,16 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
         self.inference_context = inference_context
 
-        if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        if model_comm_pgs is None:
+            # For backward compatibility, remove in v0.14 and raise error
+            # raise ValueError("TEDotProductAttention was called without ModelCommProcessGroups")
+            model_comm_pgs = ModelCommProcessGroups(
+                tp=parallel_state.get_tensor_model_parallel_group(),
+                pp=parallel_state.get_pipeline_model_parallel_group(),
+            )
 
-        self.tp_group = pg_collection.tp
-        self.pp_group = pg_collection.pp
+        self.tp_group = model_comm_pgs.tp
+        self.pp_group = model_comm_pgs.pp
         self.tp_size = torch.distributed.get_world_size(self.tp_group)
 
         if self.inference_wrapper_config.fp8 is not None:
@@ -162,23 +168,6 @@ class AbstractModelInferenceWrapper(abc.ABC):
             runtime_gather_output=True,  # Inference should always gather the logits
         )
 
-    @torch.no_grad()
-    def dummy_forward(self):
-        """Run a dummy forward pass through the model, with a single token.
-        Use-case: Used in EP on ranks which do not have any work, but are needed
-        for the all-to-all communication."""
-        # we use num_dummy_tokens equal to tensor model parallel size
-        # so that the dummy forward pass will work with sequence parallel
-        num_dummy_tokens = self.tp_size
-        tokens = torch.zeros(
-            (1, num_dummy_tokens), dtype=torch.long, device=torch.cuda.current_device()
-        )
-        position_ids = torch.zeros(
-            (1, num_dummy_tokens), dtype=torch.long, device=torch.cuda.current_device()
-        )
-        attention_mask = None
-        return self.model(tokens, position_ids, attention_mask)
-
     def _get_batch_size_and_seq_len(
         self, tokens: torch.Tensor, recv_buffer_seq_len: Optional[int] = None
     ):
@@ -252,8 +241,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
             recv_buffer = self._allocate_recv_buffer(batch_size, seq_len)
             recv_from_prev_pipeline_rank_(recv_buffer, self.pp_group)
 
-        set_input_tensor = get_attr_wrapped_model(self.model, "set_input_tensor")
-        set_input_tensor(recv_buffer)
+        self.model.set_input_tensor(recv_buffer)
         output_tensor = self._forward(inference_input)
 
         if not is_pipeline_last_stage(self.pp_group):
@@ -377,8 +365,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         Returns:
             torch.Tensor: The output logits of shape [batch_size, seq_len, padded_vocab_size]. The logits are returned only in the last pipeline stage for PP models.
         """
-        # Check if we are in a PP model
-        if not (is_pipeline_first_stage(self.pp_group) and is_pipeline_last_stage(self.pp_group)):
+        if self.model_is_pipeline_parallel:
             tokens = inference_input["tokens"]
             current_batch_size, seq_len = self._get_batch_size_and_seq_len(
                 tokens, recv_buffer_seq_len

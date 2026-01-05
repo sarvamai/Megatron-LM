@@ -29,7 +29,6 @@ class TestNonPersistentSaveAndLoad:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.skip
     @pytest.mark.parametrize(('tp,pp'), [(2, 4)])
     def test_basic_save_load_scenarios(self, tmp_path_dist_ckpt, tp, pp):
         Utils.initialize_model_parallel(tp, pp)

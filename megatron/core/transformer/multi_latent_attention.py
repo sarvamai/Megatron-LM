@@ -22,7 +22,7 @@ from megatron.core.models.common.embeddings import (
     _yarn_get_mscale,
     apply_rotary_pos_emb,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
@@ -87,12 +87,12 @@ class MultiLatentAttention(Attention):
     def __init__(
         self,
         config: MLATransformerConfig,
-        submodules: MLASelfAttentionSubmodules,
+        submodules: Union[MLASelfAttentionSubmodules],
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
         cp_comm_type: Optional[str] = None,
-        pg_collection: Optional[ProcessGroupCollection] = None,
+        model_comm_pgs: ModelCommProcessGroups = None,
     ) -> None:
 
         super().__init__(
@@ -101,9 +101,8 @@ class MultiLatentAttention(Attention):
             layer_number=layer_number,
             attention_type=attention_type,
             attn_mask_type=attn_mask_type,
-            pg_collection=pg_collection,
+            model_comm_pgs=model_comm_pgs,
         )
-        self.config: MLATransformerConfig
 
         self.query_projection_size = self.config.v_head_dim * self.config.num_attention_heads
 
@@ -128,7 +127,7 @@ class MultiLatentAttention(Attention):
                 self.config.qk_pos_emb_head_dim,
                 rotary_percent=self.config.rotary_percent,
                 rotary_base=self.config.rotary_base,
-                cp_group=self.pg_collection.cp,
+                cp_group=self.model_comm_pgs.cp,
             )
         elif self.config.rope_type == "yarn":
 
@@ -141,7 +140,7 @@ class MultiLatentAttention(Attention):
                 beta_slow=self.config.beta_slow,
                 mscale=self.config.mscale,
                 mscale_all_dim=self.config.mscale_all_dim,
-                cp_group=self.pg_collection.cp,
+                cp_group=self.model_comm_pgs.cp,
             )
         else:
             raise ValueError(
@@ -159,7 +158,7 @@ class MultiLatentAttention(Attention):
             k_channels=self.q_head_dim,
             v_channels=self.config.v_head_dim,
             cp_comm_type=cp_comm_type,
-            pg_collection=self.pg_collection,
+            model_comm_pgs=self.model_comm_pgs,
         )
 
         # Output.
@@ -178,17 +177,12 @@ class MultiLatentAttention(Attention):
 
         if (
             HAVE_TE
+            and self.config.fp8
+            and self.config.fp8_recipe != 'delayed'
+            and is_te_min_version("2.6.0dev0")
             and isinstance(self.linear_proj, TELinear)
-            and (
-                (
-                    self.config.fp8
-                    and self.config.fp8_recipe != 'delayed'
-                    and is_te_min_version("2.6.0dev0")
-                )
-                or (self.config.fp4 and is_te_min_version("2.7.0.dev0"))
-            )
         ):
-            # For fp8/fp4 training, the output of the fused core_attn is saved by itself, and
+            # For fp8 training, the output of the fused core_attn is saved by itself, and
             # linear_proj also saves the quantized tensor of this output. Here we set the
             # linear_proj to save the original input tensors to avoid the extra memory usage of
             # the quantized tensor.
@@ -203,7 +197,6 @@ class MultiLatentAttention(Attention):
         rotary_pos_emb=None,
         rotary_pos_cos=None,
         rotary_pos_sin=None,
-        rotary_pos_cos_sin=None,
         attention_bias=None,
         packed_seq_params=None,
         position_ids=None,
@@ -217,7 +210,6 @@ class MultiLatentAttention(Attention):
         assert (
             rotary_pos_cos is None and rotary_pos_sin is None
         ), "MLA does not support Flash Decoding"
-        assert not rotary_pos_cos_sin, "Flash-infer rope has not been tested with MLA."
         assert not (
             self.training and self.cache_mla_latents
         ), "cache_mla_latents conflicts with training."
@@ -345,7 +337,7 @@ class MLASelfAttention(MultiLatentAttention):
         layer_number: int,
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: Optional[str] = None,
-        pg_collection: Optional[ProcessGroupCollection] = None,
+        model_comm_pgs: ModelCommProcessGroups = None,
     ):
         super().__init__(
             config=config,
@@ -354,7 +346,7 @@ class MLASelfAttention(MultiLatentAttention):
             attn_mask_type=attn_mask_type,
             attention_type="self",
             cp_comm_type=cp_comm_type,
-            pg_collection=pg_collection,
+            model_comm_pgs=model_comm_pgs,
         )
 
         if self.config.q_lora_rank is None:
@@ -619,7 +611,7 @@ class MLASelfAttention(MultiLatentAttention):
                 rotary_pos_emb,
                 config=self.config,
                 cu_seqlens_q=cu_seqlens_q,
-                cp_group=self.pg_collection.cp,
+                cp_group=self.model_comm_pgs.cp,
                 mscale=mscale,
             )
             # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
@@ -627,7 +619,7 @@ class MLASelfAttention(MultiLatentAttention):
                 k_pos_emb,
                 rotary_pos_emb,
                 config=self.config,
-                cp_group=self.pg_collection.cp,
+                cp_group=self.model_comm_pgs.cp,
                 mscale=mscale,
             )
 
@@ -696,8 +688,8 @@ class MLASelfAttention(MultiLatentAttention):
 
             # todo add assert about fusions and caching
             if self.config.apply_rope_fusion:
-                cp_rank = self.pg_collection.cp.rank()
-                cp_size = self.pg_collection.cp.size()
+                cp_rank = self.model_comm_pgs.cp.rank()
+                cp_size = self.model_comm_pgs.cp.size()
                 query = fused_apply_mla_rope_for_q(
                     q,
                     rotary_pos_cos,
@@ -757,7 +749,7 @@ class MLASelfAttention(MultiLatentAttention):
                     config=self.config,
                     cu_seqlens=cu_seqlens_q,
                     mscale=mscale,
-                    cp_group=self.pg_collection.cp,
+                    cp_group=self.model_comm_pgs.cp,
                 )
                 # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
                 k_pos_emb = apply_rotary_pos_emb(
@@ -766,7 +758,7 @@ class MLASelfAttention(MultiLatentAttention):
                     config=self.config,
                     cu_seqlens=cu_seqlens_kv,
                     mscale=mscale,
-                    cp_group=self.pg_collection.cp,
+                    cp_group=self.model_comm_pgs.cp,
                 )
 
                 # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
@@ -787,8 +779,7 @@ class MLASelfAttention(MultiLatentAttention):
             return query, key, value
 
         if self.recompute_up_proj:
-            quantization = self.config.fp8 or self.config.fp4
-            self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=quantization)
+            self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=self.config.fp8)
             query, key, value = self.qkv_up_checkpoint.checkpoint(
                 qkv_up_proj_and_rope_apply, q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
             )
@@ -918,129 +909,9 @@ class MLASelfAttention(MultiLatentAttention):
         self.linear_proj.backward_dw()
 
     def set_for_recompute_input_layernorm(self):
-        """Set the attention layer for recompute input_layernorm. Only needed for fp8/fp4."""
+        """Set the attention layer for recompute input_layernorm. Only needed for fp8."""
         from megatron.core.extensions.transformer_engine import set_save_original_input
 
         if self.config.q_lora_rank is not None:
             set_save_original_input(self.linear_q_down_proj)
         set_save_original_input(self.linear_kv_down_proj)
-
-    def clip_qk(self):
-        """
-        QK Clipping is a technique to clip the query and key attention logits to prevent the
-        attention logits from exploding. Per MuonClip usage, we update the weight by calling this
-        function after Muon optimizer step.
-        """
-
-        if not self.config.qk_clip:
-            raise ValueError("qk_clip option needs to be enabled")
-
-        if self.core_attention.current_max_attn_logits is None:
-            raise ValueError("current_max_attn_logits is None")
-
-        # Check if we're in absorption mode
-        if self.cache_mla_latents and not hasattr(self, 'linear_kv_up_proj'):
-            raise ValueError(
-                "qk_clip is not supported when cache_mla_latents is enabled and absorption is "
-                "active. The linear_kv_up_proj layer has been deleted during absorption "
-                "preparation."
-            )
-
-        assert self.core_attention.current_max_attn_logits.shape == (
-            self.num_attention_heads_per_partition,
-        ), f"current_max_attn_logits shape is not ({self.num_attention_heads_per_partition}, ) \
-                    but {self.core_attention.current_max_attn_logits.shape}"
-
-        # only update the weight if any head has
-        # current_max_attn_logits > qk_clip_threshold
-        if torch.any(self.core_attention.current_max_attn_logits > self.config.qk_clip_threshold):
-            # Use num_attention_heads_per_partition for tensor parallel scenarios
-
-            # qk_clip_balancing_eta (n, 1, 1)
-            assert self.core_attention.current_max_attn_logits.shape == (
-                self.num_attention_heads_per_partition,
-            ), f"current_max_attn_logits shape is not ({self.num_attention_heads_per_partition},) \
-                but {self.core_attention.current_max_attn_logits.shape}"
-            self.qk_clip_balancing_eta = torch.clamp(
-                self.config.qk_clip_threshold / self.core_attention.current_max_attn_logits, max=1.0
-            ).view(self.num_attention_heads_per_partition, 1, 1)
-            assert torch.all(self.qk_clip_balancing_eta <= 1.0)
-
-            # Update q side weight, keep qk_pos_emb_head_dim side weight unchanged
-            if self.config.q_lora_rank is None:
-                q_proj_weight = self.linear_q_proj.weight
-            else:
-                q_proj_weight = self.linear_q_up_proj.weight
-
-            # Handle different weight access patterns (main_param vs direct access)
-            if hasattr(q_proj_weight, 'main_param'):
-                q_proj_weight.main_param.data.copy_(
-                    self._clip_q_proj_weight(q_proj_weight.main_param.data)
-                )
-            q_proj_weight.data.copy_(self._clip_q_proj_weight(q_proj_weight.data))
-
-            # Update k side weight, keep v side weight unchanged
-            kv_proj_weight = self.linear_kv_up_proj.weight
-
-            # Handle different weight access patterns
-            if hasattr(kv_proj_weight, 'main_param'):
-                kv_proj_weight.main_param.data.copy_(
-                    self._clip_kv_proj_weight(kv_proj_weight.main_param.data)
-                )
-            kv_proj_weight.data.copy_(self._clip_kv_proj_weight(kv_proj_weight.data))
-
-        # reset current_max_attn_logits
-        self.core_attention.current_max_attn_logits = None
-
-    def _clip_q_proj_weight(self, weight):
-        """Clip q_proj_weight"""
-        # Reshape to (n, a + b, -1)
-        weight_reshaped = weight.view(
-            self.num_attention_heads_per_partition,
-            self.config.qk_head_dim + self.config.qk_pos_emb_head_dim,
-            -1,
-        )
-
-        # Split into qk_head_dim and qk_pos_emb_head_dim parts: (n, a, -1) and (n, b, -1)
-        weight_q_nope = weight_reshaped[:, : self.config.qk_head_dim, :]
-        weight_q_pe = weight_reshaped[:, self.config.qk_head_dim :, :]
-
-        # Clipping
-        weight_q_nope.mul_(torch.pow(self.qk_clip_balancing_eta, self.config.qk_clip_alpha))
-        weight_q_pe.mul_(self.qk_clip_balancing_eta)
-
-        # Concatenate back and reshape to original shape
-        weight_q_updated = torch.cat([weight_q_nope, weight_q_pe], dim=1)
-        weight_q_updated = weight_q_updated.view(
-            self.num_attention_heads_per_partition
-            * (self.config.qk_head_dim + self.config.qk_pos_emb_head_dim),
-            -1,
-        )
-
-        return weight_q_updated
-
-    def _clip_kv_proj_weight(self, weight):
-        """Clip kv_proj_weight"""
-        # shape: (n, qk_head_dim + v_head_dim, kv_lora_rank)
-        weight_reshaped = weight.view(
-            self.num_attention_heads_per_partition,
-            self.config.qk_head_dim + self.config.v_head_dim,
-            -1,
-        )
-
-        # Split into qk_head_dim and v_head_dim parts: (n, a, -1) and (n, b, -1)
-        weight_k = weight_reshaped[:, : self.config.qk_head_dim, :]
-        weight_v = weight_reshaped[:, self.config.qk_head_dim :, :]
-
-        # Clipping
-        weight_k.mul_(torch.pow(self.qk_clip_balancing_eta, 1 - self.config.qk_clip_alpha))
-
-        # Concatenate back and reshape to original shape
-        weight_kv_updated = torch.cat([weight_k, weight_v], dim=1)
-        weight_kv_updated = weight_kv_updated.view(
-            self.num_attention_heads_per_partition
-            * (self.config.qk_head_dim + self.config.v_head_dim),
-            -1,
-        )
-
-        return weight_kv_updated

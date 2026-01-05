@@ -18,7 +18,7 @@ from megatron.core.tensor_parallel.mappings import (
     reduce_scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
-from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
+from megatron.core.transformer.moe.moe_utils import ModelCommProcessGroups
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     is_te_min_version,
@@ -41,15 +41,15 @@ class SharedExpertMLP(MLP):
         config: TransformerConfig,
         submodules: MLPSubmodules,
         gate: bool,
-        pg_collection: Optional[ProcessGroupCollection] = None,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
     ):
         config = deepcopy(config)
         assert config.add_bias_linear == False, "bias is not supported in the shared experts, "
         "please set '--disable-bias-linear' instead."
 
         config.ffn_hidden_size = config.moe_shared_expert_intermediate_size
-        # TODO(Hepteract): pass pg_collection to MLP after refactoring MLP
-        super().__init__(config=config, submodules=submodules, tp_group=pg_collection.tp)
+        # TODO(Hepteract): pass model_comm_pgs to MLP after refactoring MLP
+        super().__init__(config=config, submodules=submodules)
 
         self.use_shared_expert_gate = gate
         if self.use_shared_expert_gate:
@@ -62,12 +62,8 @@ class SharedExpertMLP(MLP):
         else:
             self.gate_weight = None
 
-        if (
-            self.config.fp8
-            and self.config.fp8_recipe != 'delayed'
-            and is_te_min_version("2.6.0dev0")
-        ) or (self.config.fp4 and is_te_min_version("2.7.0.dev0")):
-            # For fp8/fp4 training, the output of pre_mlp_layernorm is saved by router, and
+        if self.config.fp8 and is_te_min_version("2.6.0dev0"):
+            # For fp8 training, the output of pre_mlp_layernorm is saved by router, and
             # the shared expert linear_fc1 also saves the quantized tensor of this output.
             # Here we set the linear_fc1 to save the original input tensors to avoid the extra
             # memory usage of the quantized tensor.
@@ -122,7 +118,7 @@ class SharedExpertMLP(MLP):
             if self.stream is None:
                 self.stream = torch.cuda.Stream()
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states):
         """Forward function"""
         output, _ = super().forward(hidden_states)
         if self.use_shared_expert_gate:
@@ -141,11 +137,7 @@ class SharedExpertMLP(MLP):
             state_dict = self.state_dict(prefix='', keep_vars=True)
             sub_sd = {
                 f'{prefix}{name}': make_sharded_tensor_for_checkpoint(
-                    state_dict[name],
-                    f'{prefix}{name}',
-                    prepend_offsets=sharded_offsets,
-                    tp_group=self.tp_group,
-                    dp_cp_group=metadata['dp_cp_group'],
+                    state_dict[name], f'{prefix}{name}', prepend_offsets=sharded_offsets
                 )
             }
             sharded_state_dict.update(sub_sd)
@@ -187,11 +179,7 @@ class SharedExpertMLP(MLP):
             intermediate_parallel, bias_parallel = self.linear_fc1(self.cached_fc1_input)
             self.cached_fc1_input = None
 
-            if self.config.use_te_activation_func:
-                if bias_parallel is not None:
-                    intermediate_parallel = intermediate_parallel + bias_parallel
-                intermediate_parallel = self.activation_func(intermediate_parallel)
-            elif self.config.bias_activation_fusion:
+            if self.config.bias_activation_fusion:
                 if self.activation_func == F.gelu:
                     if self.config.gated_linear_unit:
                         intermediate_parallel = bias_geglu_impl(

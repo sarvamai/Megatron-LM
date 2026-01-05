@@ -1,6 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Union
@@ -8,14 +7,13 @@ from typing import Callable, List, Optional, Union
 import torch
 from torch import Tensor
 
-from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core import InferenceParams, mpu, parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.pipeline_parallel.utils import is_vp_last_stage
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.tensor_parallel import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
@@ -26,7 +24,6 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
-    get_pg_rank,
     is_torch_min_version,
     make_tp_sharded_tensor_for_checkpoint,
     make_viewless_tensor,
@@ -55,11 +52,7 @@ except ImportError:
 
 
 def tie_word_embeddings_state_dict(
-    sharded_state_dict: ShardedStateDict,
-    word_emb_weight: Tensor,
-    word_emb_weight_key: str,
-    tp_group: Optional[torch.distributed.ProcessGroup] = None,
-    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    sharded_state_dict: ShardedStateDict, word_emb_weight: Tensor, word_emb_weight_key: str
 ) -> None:
     """tie the embedding of the mtp processing stage in a given sharded state dict.
 
@@ -67,15 +60,13 @@ def tie_word_embeddings_state_dict(
         sharded_state_dict (ShardedStateDict): state dict with the weight to tie.
         word_emb_weight (Tensor): weight of the word embedding.
         word_emb_weight_key (str): key of the word embedding in the sharded state dict.
-        tp_group (torch.distributed.ProcessGroup): The tensor parallel group
-        dp_cp_group (torch.distributed.ProcessGroup): The dp-cp comm group
 
     Returns: None, acts in-place
     """
     mtp_word_emb_replica_id = (
         1,  # copy of embedding in pre processing stage
         0,
-        get_pg_rank(dp_cp_group),
+        parallel_state.get_data_parallel_rank(with_context_parallel=True),
     )
     assert word_emb_weight_key in sharded_state_dict
     del sharded_state_dict[word_emb_weight_key]
@@ -84,17 +75,11 @@ def tie_word_embeddings_state_dict(
         key=word_emb_weight_key,
         replica_id=mtp_word_emb_replica_id,
         allow_shape_mismatch=True,
-        tp_group=tp_group,
-        dp_cp_group=dp_cp_group,
     )
 
 
 def tie_output_layer_state_dict(
-    sharded_state_dict: ShardedStateDict,
-    output_layer_weight: Tensor,
-    output_layer_weight_key: str,
-    tp_group: Optional[torch.distributed.ProcessGroup] = None,
-    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    sharded_state_dict: ShardedStateDict, output_layer_weight: Tensor, output_layer_weight_key: str
 ) -> None:
     """tie the output layer of the mtp processing stage in a given sharded state dict.
 
@@ -102,15 +87,13 @@ def tie_output_layer_state_dict(
         sharded_state_dict (ShardedStateDict): state dict with the weight to tie.
         output_layer_weight (Tensor): weight of the output layer.
         output_layer_weight_key (str): key of the output layer in the sharded state dict.
-        tp_group (torch.distributed.ProcessGroup): The tensor parallel group
-        dp_cp_group (torch.distributed.ProcessGroup): The dp-cp comm group
 
     Returns: None, acts in-place
     """
     mtp_output_layer_replica_id = (
         1,  # copy of output layer in post processing stage
         0,
-        get_pg_rank(dp_cp_group),
+        parallel_state.get_data_parallel_rank(with_context_parallel=True),
     )
     assert output_layer_weight_key in sharded_state_dict
     del sharded_state_dict[output_layer_weight_key]
@@ -119,12 +102,10 @@ def tie_output_layer_state_dict(
         key=output_layer_weight_key,
         replica_id=mtp_output_layer_replica_id,
         allow_shape_mismatch=True,
-        tp_group=tp_group,
-        dp_cp_group=dp_cp_group,
     )
 
 
-def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=None):
+def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None):
     """Roll the tensor input along the sequence dimension with Context Parallelism (CP) support.
 
     This function extends the original roll_tensor to support Context Parallelism, which allows
@@ -136,24 +117,15 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
     For CP>1: Splits tensor into chunks, performs rolling within each chunk, then exchanges
     boundary elements between adjacent CP ranks to maintain sequence continuity.
 
-    For packed sequences: Respects sequence boundaries when rolling to avoid mixing tokens
-    from different sequences.
-
     Args:
         tensor (Tensor): The input tensor to roll.
         shifts (int): The shift of the tensor (typically -1 for MTP).
         dims (int): The dimension to roll (typically -1 for sequence dimension).
         cp_group (ProcessGroup): The context parallelism process group. If None or size=1,
                                falls back to standard rolling behavior.
-        packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
-                                            If provided, respects sequence boundaries.
     Returns:
         tuple: (rolled_tensor, sum_of_rolled_tensor)
     """
-    # Handle packed sequences cases
-    if packed_seq_params is not None:
-        return _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group)
-
     # Standard rolling behavior when CP is not enabled (cp_group is None or size=1)
     if cp_group is None or cp_group.size() == 1:
         rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
@@ -222,91 +194,6 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
     return rolled_tensor, rolled_tensor.sum()
 
 
-def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=None):
-    """Roll tensor with packed sequence support.
-    This function handles rolling for packed sequences by respecting sequence boundaries
-    """
-
-    # Notice: This is a naive implementation to test the correctness,
-    # a better solution will only sync the boundary tokens once.
-    assert (
-        dims == -1 or dims == tensor.dim() - 1
-    ), "Packed sequence roll only supports the last dimension."
-    assert shifts == -1, "Packed sequence roll only supports a single-token left shift."
-    cu_seqlens = packed_seq_params.cu_seqlens_q
-    assert cu_seqlens is not None, "Packed sequence parameters must provide cu_seqlens_q."
-
-    rolled_tensor = tensor.clone()
-
-    cp_size = cp_group.size() if cp_group is not None else 1
-    if cp_size == 1:
-        # CP disabled: roll each packed sequence independently within its boundaries
-        for i in range(len(cu_seqlens) - 1):
-            start_idx = cu_seqlens[i]
-            end_idx = cu_seqlens[i + 1]
-            seq_slice = tensor[..., start_idx:end_idx]
-            rolled_seq = torch.roll(seq_slice, shifts=shifts, dims=dims)
-            # Zero out the last position(s) that would cross sequence boundaries
-            rolled_seq[..., shifts:] = 0
-            rolled_tensor[..., start_idx:end_idx] = rolled_seq
-        return rolled_tensor, rolled_tensor.sum()
-
-    # CP enabled: each rank owns two chunks per sequence (front and mirrored tail).
-    local_rank = torch.distributed.get_rank(group=cp_group)
-    global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
-    next_rank = global_ranks[(local_rank + 1) % cp_size]
-    prev_rank = global_ranks[(local_rank - 1) % cp_size]
-
-    # Iterate over each sequence individually
-    for i in range(len(cu_seqlens) - 1):
-        start_idx = cu_seqlens[i]
-        end_idx = cu_seqlens[i + 1]
-
-        # the idx has been multiplied by cp_size, need to divide it by cp_size to get the local idx
-        local_start_idx = start_idx // cp_size
-        local_end_idx = end_idx // cp_size
-        tensor_slice = rolled_tensor[..., local_start_idx:local_end_idx].clone()
-
-        # The following code is very similar as the code in roll_tensor function
-        local_chunks = tensor_slice.chunk(2, dim=dims)
-        rolled_chunks = [torch.roll(chunk, shifts=shifts, dims=dims) for chunk in local_chunks]
-
-        tensor_send_list = []
-        tensor_recv_list = []
-        for chunk in rolled_chunks:
-            boundary = chunk.select(dims, shifts).contiguous().clone()
-            tensor_send_list.append(boundary)
-            tensor_recv_list.append(torch.empty_like(boundary))
-
-        ops = []
-        if local_rank != 0:
-            ops.append(torch.distributed.isend(tensor=tensor_send_list[0], dst=prev_rank))
-            ops.append(torch.distributed.irecv(tensor=tensor_recv_list[1], src=prev_rank))
-        else:
-            tensor_recv_list[1].zero_()
-
-        if local_rank != cp_size - 1:
-            ops.append(torch.distributed.irecv(tensor=tensor_recv_list[0], src=next_rank))
-            ops.append(torch.distributed.isend(tensor=tensor_send_list[1], dst=next_rank))
-        else:
-            tensor_recv_list[0].copy_(tensor_send_list[1])
-
-        for op in ops:
-            op.wait()
-
-        index = [slice(None)] * rolled_chunks[0].dim()
-        index[dims] = shifts
-        for chunk, recv in zip(rolled_chunks, tensor_recv_list):
-            chunk[tuple(index)] = recv
-
-        seq_result = torch.cat(rolled_chunks, dim=dims)
-
-        # update the rolled tensor
-        rolled_tensor[..., local_start_idx:local_end_idx] = seq_result
-
-    return rolled_tensor, rolled_tensor.sum()
-
-
 class MTPLossLoggingHelper:
     """Helper class for logging MTP losses."""
 
@@ -317,8 +204,8 @@ class MTPLossLoggingHelper:
         loss: torch.Tensor,
         layer_number: int,
         num_layers: int,
-        reduce_group: Optional[torch.distributed.ProcessGroup] = None,
-        avg_group: Optional[torch.distributed.ProcessGroup] = None,
+        reduce_group: torch.distributed.ProcessGroup = None,
+        avg_group: torch.distributed.ProcessGroup = None,
     ):
         """Save the mtp loss for logging.
         Args:
@@ -450,16 +337,10 @@ def get_mtp_layer_offset(config: TransformerConfig) -> int:
     return 0
 
 
-def get_mtp_num_layers_to_build(
-    config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
-) -> int:
+def get_mtp_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] = None) -> int:
     """Get the number of MTP layers to build."""
     # Currently, we only support put all of MTP layers on the last pipeline stage.
-    vp_size = config.virtual_pipeline_model_parallel_size
-    if pp_rank is None:
-        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-    is_last_pp_stage = pp_rank == config.pipeline_model_parallel_size - 1
-    if is_vp_last_stage(vp_stage=vp_stage, vp_size=vp_size) and is_last_pp_stage:
+    if mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage):
         return config.mtp_num_layers if config.mtp_num_layers else 0
     else:
         return 0
@@ -537,14 +418,14 @@ class MultiTokenPredictionLayer(MegatronModule):
         submodules: MultiTokenPredictionLayerSubmodules,
         layer_number: int = 1,
         vp_stage: Optional[int] = None,
-        pg_collection: Optional[ProcessGroupCollection] = None,
+        model_comm_pgs: ModelCommProcessGroups = None,
     ):
         super().__init__(config=config)
         self.sequence_parallel = config.sequence_parallel
         self.submodules = submodules
         self.layer_number = layer_number
         self.vp_stage = vp_stage
-        self.cp_group = pg_collection.cp
+        self.cp_group = model_comm_pgs.cp
 
         self_attention_spec = self.submodules.transformer_layer.submodules.self_attention
         attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
@@ -569,7 +450,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         )
 
         # For the linear projection at the (k - 1)-th MTP layer, the input is the concatenation
-        # of the i-th token's hidden states and the (i + K)-th token's decoder input,
+        # of the i-th tocken's hidden states and the (i + K)-th tocken's decoder input,
         # so the input's shape is [s, b, 2*h].
         # The output will be send to the following transformer layer,
         # so the output's shape should be [s, b, h].
@@ -602,7 +483,6 @@ class MultiTokenPredictionLayer(MegatronModule):
         position_ids: torch.Tensor,
         embedding: Callable,
         hidden_states: torch.Tensor,
-        packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """
         Preprocesses input data for the Multi-Token Prediction (MTP) layers.
@@ -617,23 +497,10 @@ class MultiTokenPredictionLayer(MegatronModule):
                 from gpt model to compute the decoder input.
             hidden_states (torch.Tensor): hidden states tensor of shape [s, b, h] where s is the
                 sequence length, b is the batch size, and h is the hidden size.
-            packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
         """
         # Calc logits for the current Multi-Token Prediction (MTP) layers.
-        input_ids, _ = roll_tensor(
-            input_ids,
-            shifts=-1,
-            dims=-1,
-            cp_group=self.cp_group,
-            packed_seq_params=packed_seq_params,
-        )
-        position_ids, _ = roll_tensor(
-            position_ids,
-            shifts=-1,
-            dims=-1,
-            cp_group=self.cp_group,
-            packed_seq_params=packed_seq_params,
-        )
+        input_ids, _ = roll_tensor(input_ids, shifts=-1, dims=-1, cp_group=self.cp_group)
+        position_ids, _ = roll_tensor(position_ids, shifts=-1, dims=-1, cp_group=self.cp_group)
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
 
@@ -649,8 +516,8 @@ class MultiTokenPredictionLayer(MegatronModule):
         decoder_input = make_viewless_tensor(inp=decoder_input, requires_grad=True, keep_graph=True)
         hidden_states = self.hnorm(hidden_states)
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
-        # At the (k - 1)-th MTP module, concatenates the i-th token's hidden_states
-        # and the (i + K)-th token's embedding, and combine them with linear projection.
+        # At the (k - 1)-th MTP module, concatenates the i-th tocken's hidden_states
+        # and the (i + K)-th tocken's embedding, and combine them with linear projection.
         hidden_states = torch.cat((decoder_input, hidden_states), -1)
         hidden_states, _ = self.eh_proj(hidden_states)
         # For tensor parallel we need to gather the tensor across the model-parallel
@@ -695,8 +562,6 @@ class MultiTokenPredictionLayer(MegatronModule):
         else:
             fp8_context = nullcontext()
             transformer_layer_fp8_context = nullcontext()
-
-        # TODO: currently ignoring FP4 in MTP layers because we need more numerical validation
 
         with rng_context:
             with fp8_context:
@@ -782,15 +647,15 @@ class MultiTokenPredictionLayer(MegatronModule):
         position_ids: Tensor,
         hidden_states: Tensor,
         attention_mask: Tensor,
-        context: Optional[Tensor] = None,
-        context_mask: Optional[Tensor] = None,
-        rotary_pos_emb: Optional[Tensor] = None,
-        rotary_pos_cos: Optional[Tensor] = None,
-        rotary_pos_sin: Optional[Tensor] = None,
-        attention_bias: Optional[Tensor] = None,
-        inference_params: Optional[InferenceParams] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
-        sequence_len_offset: Optional[Tensor] = None,
+        context: Tensor = None,
+        context_mask: Tensor = None,
+        rotary_pos_emb: Tensor = None,
+        rotary_pos_cos: Tensor = None,
+        rotary_pos_sin: Tensor = None,
+        attention_bias: Tensor = None,
+        inference_params: InferenceParams = None,
+        packed_seq_params: PackedSeqParams = None,
+        sequence_len_offset: Tensor = None,
         embedding=None,
     ):
         """
@@ -816,13 +681,15 @@ class MultiTokenPredictionLayer(MegatronModule):
             [s, b, h], and optionally the updated context tensor if cross-attention is used.
         """
         assert context is None, f"multi token prediction + cross attention is not yet supported."
+        assert (
+            packed_seq_params is None
+        ), f"multi token prediction + sequence packing is not yet supported."
 
         input_ids, position_ids, decoder_input, hidden_states = self._get_embeddings(
             input_ids=input_ids,
             position_ids=position_ids,
             embedding=embedding,
             hidden_states=hidden_states,
-            packed_seq_params=packed_seq_params,
         )
 
         if self.config.recompute_granularity == 'full' and self.training:
@@ -893,7 +760,7 @@ class MultiTokenPredictionBlockSubmodules:
             projection matrix, transformer block, shared output head).
     """
 
-    layer_specs: Optional[List[ModuleSpec]] = None
+    layer_specs: List[ModuleSpec] = None
 
 
 def _get_mtp_block_submodules(
@@ -949,7 +816,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         config: TransformerConfig,
         spec: Union[TransformerBlockSubmodules, ModuleSpec],
         vp_stage: Optional[int] = None,
-        pg_collection: Optional[ProcessGroupCollection] = None,
+        model_comm_pgs: ModelCommProcessGroups = None,
     ):
         super().__init__(config=config)
         self.submodules = _get_mtp_block_submodules(config, spec)
@@ -959,31 +826,28 @@ class MultiTokenPredictionBlock(MegatronModule):
         # Initialize Context Parallelism (CP) support for MTP
         # This enables MTP to work with CP > 1 by providing the CP process group
         # to the roll_tensor function for proper boundary communication
-        if pg_collection is None:
+        if model_comm_pgs is None:
             # Use default MPU process groups if not provided
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['cp'])
+            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups(required_pgs=['cp'])
         else:
             # Ensure the provided process groups include CP
             assert hasattr(
-                pg_collection, 'cp'
-            ), "MultiTokenPredictionBlock pg_collection must have cp process group"
+                model_comm_pgs, 'cp'
+            ), "MultiTokenPredictionBlock model_comm_pgs must have cp process group"
 
-        self._build_layers(pg_collection)
+        self._build_layers(model_comm_pgs)
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
-        self.cp_group = pg_collection.cp
+        self.cp_group = model_comm_pgs.cp
 
-    def _build_layers(self, pg_collection):
+    def _build_layers(self, model_comm_pgs):
         def build_layer(layer_spec, layer_number):
-            fp8_init_context = get_fp8_context(self.config, is_init=True)
-            with fp8_init_context:
-                module = build_module(
-                    layer_spec,
-                    config=self.config,
-                    layer_number=layer_number,
-                    vp_stage=self.vp_stage,
-                    pg_collection=pg_collection,
-                )
-            return module
+            return build_module(
+                layer_spec,
+                config=self.config,
+                layer_number=layer_number,
+                vp_stage=self.vp_stage,
+                model_comm_pgs=model_comm_pgs,
+            )
 
         self.layers = torch.nn.ModuleList(
             [
@@ -998,16 +862,16 @@ class MultiTokenPredictionBlock(MegatronModule):
         position_ids: Tensor,
         hidden_states: Tensor,
         attention_mask: Tensor,
-        context: Optional[Tensor] = None,
-        context_mask: Optional[Tensor] = None,
-        rotary_pos_emb: Optional[Tensor] = None,
-        rotary_pos_cos: Optional[Tensor] = None,
-        rotary_pos_sin: Optional[Tensor] = None,
-        attention_bias: Optional[Tensor] = None,
-        inference_params: Optional[InferenceParams] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
-        sequence_len_offset: Optional[Tensor] = None,
-        extra_block_kwargs: Optional[dict] = None,
+        context: Tensor = None,
+        context_mask: Tensor = None,
+        rotary_pos_emb: Tensor = None,
+        rotary_pos_cos: Tensor = None,
+        rotary_pos_sin: Tensor = None,
+        attention_bias: Tensor = None,
+        inference_params: InferenceParams = None,
+        packed_seq_params: PackedSeqParams = None,
+        sequence_len_offset: Tensor = None,
+        extra_block_kwargs: dict = None,
         embedding=None,
     ) -> Tensor:
         """

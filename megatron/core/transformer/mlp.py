@@ -1,5 +1,4 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-
 import gc
 import logging
 import warnings
@@ -16,11 +15,7 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedStateDict,
     ShardedTensorFactory,
 )
-from megatron.core.fusions.fused_bias_geglu import (
-    bias_geglu_impl,
-    quick_gelu,
-    weighted_bias_quick_geglu_impl,
-)
+from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.transformer.module import MegatronModule
@@ -46,13 +41,7 @@ logger = logging.getLogger(__name__)
 # pylint: disable=missing-class-docstring
 @dataclass
 class MLPSubmodules:
-    """
-    The dataclass for ModuleSpecs of MLP submodules
-    including  linear fc1, activation function, linear fc2.
-    """
-
     linear_fc1: Union[ModuleSpec, type] = None
-    activation_func: Union[ModuleSpec, type] = None
     linear_fc2: Union[ModuleSpec, type] = None
 
 
@@ -79,7 +68,7 @@ class MLP(MegatronModule):
         submodules: MLPSubmodules,
         is_expert: bool = False,
         input_size: Optional[int] = None,
-        ffn_hidden_size: Optional[int] = None,
+        ffn_hidden_size: int = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__(config=config)
@@ -88,7 +77,7 @@ class MLP(MegatronModule):
 
         self.input_size = input_size if input_size != None else self.config.hidden_size
 
-        self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
+        tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         if ffn_hidden_size is None:
             if is_expert:
                 raise ValueError("MoE MLP requires `ffn_hidden_size`, but it was not provided.")
@@ -102,21 +91,12 @@ class MLP(MegatronModule):
 
         # If this is a gated linear unit we double the output width
         # see https://arxiv.org/pdf/2002.05202.pdf
-        # For GLU/SwiGLU, use stride=2 because each TP rank stores interleaved [gate, up] portions.
-        # This is critical for correct weight resharding across different TP sizes.
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
-            fc1_stride = 2
-        else:
-            fc1_stride = 1
-
-        # Use moe_latent_size only for routed experts. 'is_expert' is false for
-        # shared_experts.
-        use_latent_size = (self.config.moe_latent_size is not None) and is_expert
 
         self.linear_fc1 = build_module(
             submodules.linear_fc1,
-            self.input_size if not use_latent_size else self.config.moe_latent_size,
+            self.input_size,
             ffn_hidden_size,
             config=self.config,
             init_method=self.config.init_method,
@@ -126,18 +106,14 @@ class MLP(MegatronModule):
             is_expert=is_expert,
             tp_comm_buffer_name="fc1",
             tp_group=tp_group,
-            stride=fc1_stride,
         )
 
-        if self.config.use_te_activation_func and not (submodules.activation_func is None):
-            self.activation_func = build_module(submodules.activation_func, config=self.config)
-        else:
-            self.activation_func = self.config.activation_func
+        self.activation_func = self.config.activation_func
 
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
             self.config.ffn_hidden_size,
-            self.config.hidden_size if not use_latent_size else self.config.moe_latent_size,
+            self.config.hidden_size,
             config=self.config,
             init_method=self.config.output_layer_init_method,
             bias=self.config.add_bias_linear,
@@ -156,15 +132,7 @@ class MLP(MegatronModule):
         nvtx_range_pop(suffix="linear_fc1")
 
         nvtx_range_push(suffix="activation")
-        if self.config.use_te_activation_func:
-            if bias_parallel is not None:
-                intermediate_parallel = intermediate_parallel + bias_parallel
-            intermediate_parallel = self.activation_func(intermediate_parallel)
-            if per_token_scale is not None:
-                original_dtype = intermediate_parallel.dtype
-                intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
-                intermediate_parallel = intermediate_parallel.to(original_dtype)
-        elif self.config.bias_activation_fusion:
+        if self.config.bias_activation_fusion:
             if per_token_scale is not None:
                 if self.activation_func == F.silu and self.config.gated_linear_unit:
                     # dtype is handled inside the fused kernel
@@ -174,19 +142,8 @@ class MLP(MegatronModule):
                         per_token_scale.unsqueeze(-1),
                         self.config.activation_func_fp8_input_store,
                     )
-                elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
-                    intermediate_parallel = weighted_bias_quick_geglu_impl(
-                        intermediate_parallel,
-                        bias_parallel,
-                        per_token_scale.unsqueeze(-1),
-                        self.config.activation_func_fp8_input_store,
-                        self.config.glu_linear_offset,
-                        self.config.activation_func_clamp_value,
-                    )
                 else:
-                    raise ValueError(
-                        "Only support fusion of swiglu and quick_gelu with per_token_scale in MLP."
-                    )
+                    raise ValueError("Only support fusion of swiglu with per_token_scale in MLP.")
             else:
                 if self.activation_func == F.gelu:
                     if self.config.gated_linear_unit:
@@ -213,13 +170,8 @@ class MLP(MegatronModule):
             if self.config.gated_linear_unit:
 
                 def glu(x):
-                    x_glu, x_linear = torch.chunk(x, 2, dim=-1)
-                    if (val := self.config.activation_func_clamp_value) is not None:
-                        x_glu = x_glu.clamp(min=None, max=val)
-                        x_linear = x_linear.clamp(min=-val, max=val)
-                    return self.config.activation_func(x_glu) * (
-                        x_linear + self.config.glu_linear_offset
-                    )
+                    x = torch.chunk(x, 2, dim=-1)
+                    return self.config.activation_func(x[0]) * x[1]
 
                 intermediate_parallel = glu(intermediate_parallel)
             else:
@@ -233,15 +185,11 @@ class MLP(MegatronModule):
 
         # [s, b, h]
         nvtx_range_push(suffix="linear_fc2")
-
         output, output_bias = self.linear_fc2(intermediate_parallel)
         nvtx_range_pop(suffix="linear_fc2")
 
-        if per_token_scale is not None and output_bias is not None:
-            # if this MLP is an expert, and bias is required, we add the bias to output directly
-            # without doing bda later.
-            output += output_bias.unsqueeze(0) * per_token_scale.unsqueeze(-1)
-            output_bias = None
+        if per_token_scale is not None:
+            assert output_bias is None, "Bias is not supported with per_token_scale"
 
         return output, output_bias
 
@@ -249,7 +197,6 @@ class MLP(MegatronModule):
     def sharded_state_dict(
         self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
-        """Return the sharded state dictionary of the module."""
         sharded_state_dict = {}
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         for name, module in self._modules.items():
@@ -307,26 +254,89 @@ def apply_swiglu_sharded_factory(
             )
             w_key = key
             v_key = key
+        if flattened_range is None:
+            tensor_w, tensor_v = torch.chunk(t, 2, dim=swiglu_shard_axis)
+            return [
+                ShardedTensor.from_rank_offsets(
+                    w_key,
+                    tensor_w,
+                    *sharded_offsets,
+                    offset_w,
+                    replica_id=replica_id,
+                    prepend_axis_num=prepend_axis_num,
+                ),
+                ShardedTensor.from_rank_offsets(
+                    v_key,
+                    tensor_v,
+                    *sharded_offsets,
+                    offset_v,
+                    replica_id=replica_id,
+                    prepend_axis_num=prepend_axis_num,
+                ),
+            ]
+        else:
+            if singleton_local_shards:
+                raise NotImplementedError(
+                    'singleton_local_shards not implemented for SwiGLU MLP flattened tensors'
+                )
+            # Here we need to map a slice `t` (`flattened_range` specifies slice start and stop)
+            # of the *original* flattened tensor into slices `w` and `v` of chunked
+            # and flattened tensor.
+            # Example:
+            # If original tensor has (16, 5) shape and flattened_range is `slice(8, 64)`,
+            # then `t` has shape `(56,)` and we need to create 2 tensors:
+            # w: first 32 elements of `t` with flattened_range slice(8, 40)
+            # v: last 24 elements of `t` with flattened_range slice(0, 24)
+            # Global offsets are the same as in the non-flattened case
+            assert t.ndim == 1, (key, t.shape)
+            non_flat_local_shape = (original_shape[0] // 2, *original_shape[1:])
+            chunk_numel = original_numel // 2
+            result = []
+            if flattened_range.start < chunk_numel:
+                # Non-empty `w` chunk
+                tensor_w = t[: chunk_numel - flattened_range.start]
+                flattened_range_w = slice(
+                    flattened_range.start, min(chunk_numel, flattened_range.stop)
+                )
+                assert len(tensor_w) == flattened_range_w.stop - flattened_range_w.start
+                result.append(
+                    ShardedTensor.from_rank_offsets_flat(
+                        key,
+                        tensor_w,
+                        non_flat_local_shape,
+                        *sharded_offsets,
+                        offset_w,
+                        replica_id=replica_id,
+                        prepend_axis_num=prepend_axis_num,
+                        flattened_range=flattened_range_w,
+                    )
+                )
+            if flattened_range.stop > chunk_numel:
+                # Non-empty `v` chunk
+                tensor_v = t[-(flattened_range.stop - chunk_numel) :]
+                flattened_range_v = slice(
+                    max(chunk_numel, flattened_range.start) - chunk_numel,
+                    flattened_range.stop - chunk_numel,
+                )
+                assert len(tensor_v) == flattened_range_v.stop - flattened_range_v.start, (
+                    len(tensor_v),
+                    flattened_range_v,
+                )
 
-        tensor_w, tensor_v = torch.chunk(t, 2, dim=swiglu_shard_axis)
-        return [
-            ShardedTensor.from_rank_offsets(
-                w_key,
-                tensor_w,
-                *sharded_offsets,
-                offset_w,
-                replica_id=replica_id,
-                prepend_axis_num=prepend_axis_num,
-            ),
-            ShardedTensor.from_rank_offsets(
-                v_key,
-                tensor_v,
-                *sharded_offsets,
-                offset_v,
-                replica_id=replica_id,
-                prepend_axis_num=prepend_axis_num,
-            ),
-        ]
+                result.append(
+                    ShardedTensor.from_rank_offsets_flat(
+                        key,
+                        tensor_v,
+                        non_flat_local_shape,
+                        *sharded_offsets,
+                        offset_v,
+                        replica_id=replica_id,
+                        prepend_axis_num=prepend_axis_num,
+                        flattened_range=flattened_range_v,
+                    )
+                )
+            assert sum(sh_ten.data.numel() for sh_ten in result) == t.numel(), (result, t.shape)
+            return result
 
     def sh_ten_merge_fn(sub_state_dict):
         with torch.no_grad():
