@@ -843,7 +843,12 @@ def get_updated_expert_bias(tokens_per_expert, expert_bias, expert_bias_update_r
         )
         average_tokens = tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
         offset = average_tokens - tokens_per_expert
-        updated_expert_bias = expert_bias + torch.sign(offset) * expert_bias_update_rate
+        # DeepSeek v3 way of doing expert bias update
+        # updated_expert_bias = expert_bias + torch.sign(offset) * expert_bias_update_rate
+
+        # Ling V2 way of doing expert bias update
+        # https://github.com/inclusionAI/Ling-V2/blob/733190f90783d07faabd7060fb64550b65d7114d/training/megatron/bailing_moe_v2.patch#L786
+        updated_expert_bias = expert_bias + (torch.sign(offset) - torch.sign(offset).mean(dim=-1, keepdim=True)) * expert_bias_update_rate
         return updated_expert_bias
 
 
