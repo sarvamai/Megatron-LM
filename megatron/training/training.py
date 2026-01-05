@@ -648,10 +648,25 @@ def pretrain(
     else:
         checkpointing_context = {}
 
+    def no_wd_decay_cond(name, param):
+        """
+        Returns True if the parameter should NOT have weight decay applied.
+        Excludes bias and embedding parameters from weight decay.
+        Norm weights (LayerNorm, BatchNorm, etc.) will have weight decay applied.
+        
+        Args:
+            name: Parameter name
+            param: Parameter tensor
+            
+        Returns:
+            bool: True if weight decay should be skipped, False otherwise
+        """
+        return 'bias' in name or 'embedding' in name
+
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider, model_type, checkpointing_context=checkpointing_context
+        model_provider, model_type, no_wd_decay_cond=no_wd_decay_cond, checkpointing_context=checkpointing_context
     )
 
     timers('model-and-optimizer-setup').stop()
